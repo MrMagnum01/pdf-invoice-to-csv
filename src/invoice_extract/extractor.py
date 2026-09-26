@@ -12,6 +12,7 @@ attempting OCR.
 from __future__ import annotations
 
 import csv
+import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -33,6 +34,8 @@ _TABLE_HEADER = ["Description", "Qty", "Unit Price", "Amount"]
 _AMOUNT_FIELDS = ("subtotal", "tax", "total")
 
 UNSUPPORTED_ISSUE = "unsupported_scanned_image"
+INVALID_LINE_ITEM_ISSUE = "invalid_line_item"
+MISSING_LINE_ITEMS_ISSUE = "missing_line_items"
 
 
 @dataclass
@@ -76,7 +79,12 @@ class InvoiceRecord:
 
 
 def _parse_amount(raw: str) -> float:
-    return float(raw.replace(",", ""))
+    value = float(raw.replace(",", ""))
+    # float() accepts "NaN" and "inf"; neither is a real amount, and NaN
+    # compares false against everything, so it would slip past validation.
+    if not math.isfinite(value):
+        raise ValueError(f"non-finite amount: {raw!r}")
+    return value
 
 
 def _extract_fields(text: str, source_file: str) -> tuple[dict, list[Issue]]:
@@ -105,8 +113,11 @@ def _extract_fields(text: str, source_file: str) -> tuple[dict, list[Issue]]:
     return fields_out, issues
 
 
-def _extract_line_items(pdf: pdfplumber.PDF, source_file: str, invoice_number: str) -> list[LineItemRecord]:
+def _extract_line_items(
+    pdf: pdfplumber.PDF, source_file: str, invoice_number: str
+) -> tuple[list[LineItemRecord], list[Issue]]:
     items: list[LineItemRecord] = []
+    issues: list[Issue] = []
     line_no = 0
     for page in pdf.pages:
         for table in page.extract_tables():
@@ -121,6 +132,21 @@ def _extract_line_items(pdf: pdfplumber.PDF, source_file: str, invoice_number: s
                     unit_price = _parse_amount(unit_price_raw)
                     amount = _parse_amount(amount_raw)
                 except (TypeError, ValueError):
+                    # Keep the row as a categorised exception rather than
+                    # dropping it: a silently skipped row would let the
+                    # invoice pass as "ok" with items missing.
+                    issues.append(
+                        Issue(
+                            source_file=source_file,
+                            invoice_number=invoice_number,
+                            issue_type=INVALID_LINE_ITEM_ISSUE,
+                            detail=(
+                                f"Line-item row {description!r} has an unreadable qty, "
+                                f"unit price or amount ({qty_raw!r}, {unit_price_raw!r}, "
+                                f"{amount_raw!r}); row not extracted."
+                            ),
+                        )
+                    )
                     continue
                 line_no += 1
                 items.append(
@@ -134,12 +160,25 @@ def _extract_line_items(pdf: pdfplumber.PDF, source_file: str, invoice_number: s
                         amount=amount,
                     )
                 )
-    return items
+    return items, issues
 
 
 def _validate_totals(record: InvoiceRecord) -> list[Issue]:
     issues: list[Issue] = []
     inv_num = record.invoice_number or ""
+
+    if not record.line_items:
+        issues.append(
+            Issue(
+                source_file=record.source_file,
+                invoice_number=inv_num,
+                issue_type=MISSING_LINE_ITEMS_ISSUE,
+                detail=(
+                    "No valid line items could be extracted, so the printed "
+                    "subtotal cannot be checked against them."
+                ),
+            )
+        )
 
     if record.subtotal is not None and record.line_items:
         computed_subtotal = round(sum(item.amount for item in record.line_items), 2)
@@ -206,7 +245,8 @@ def extract_pdf(path: Path) -> InvoiceRecord:
             total=fields_out.get("total"),
         )
         record.issues.extend(missing_issues)
-        record.line_items = _extract_line_items(pdf, source_file, record.invoice_number or "")
+        record.line_items, item_issues = _extract_line_items(pdf, source_file, record.invoice_number or "")
+        record.issues.extend(item_issues)
         record.issues.extend(_validate_totals(record))
 
     return record

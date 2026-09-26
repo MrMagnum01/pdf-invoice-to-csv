@@ -46,3 +46,9 @@ def test_missing_amount_fields_skip_that_check_without_crashing():
 def test_rounding_within_a_cent_is_not_flagged():
     rec = _record(subtotal=100.004, total=108.004)
     assert _validate_totals(rec) == []
+
+
+def test_no_line_items_is_flagged_even_when_totals_agree():
+    rec = _record(line_items=[], subtotal=10.0, tax=0.0, total=10.0)
+    issues = _validate_totals(rec)
+    assert [i.issue_type for i in issues] == ["missing_line_items"]
